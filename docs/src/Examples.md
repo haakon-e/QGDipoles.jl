@@ -47,7 +47,7 @@ K, a = SolveInhomEVP(A, B, c, d; K₀ = 4, tol)
 nothing
 ```
 
-The intermediate parameters, ``\lambda`` and ``\mu``, describe the rescaled vortex radius and PV gradient.
+The intermediate parameters, ``λ`` and ``μ``, describe the rescaled vortex radius and PV gradient.
 Finally, we can define a grid and evaluate our streamfunction, PV and velocities using:
 
 ```@example 1layer

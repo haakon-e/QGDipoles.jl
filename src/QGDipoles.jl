@@ -86,4 +86,19 @@ include("energetics.jl")
 include("vortex_types.jl")
 include("monopoles.jl")
 
+import RecipesBase: @recipe
+
+@recipe function f(grid::GridStruct, ψ::AbstractArray; layer = 1)
+	# Set default attributes
+	aspect_ratio --> 1
+	colormap --> :balance
+	xlims --> (minimum(grid.x), maximum(grid.x) + step(grid.x))
+	ylims --> (minimum(grid.y), maximum(grid.y) + step(grid.y))
+	xlabel --> "x"
+	ylabel --> "y"
+	
+	# Return the plotted values
+	grid.x, grid.y, transpose(@view(ψ[:, :, layer]))
+end
+
 end

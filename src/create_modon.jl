@@ -64,12 +64,10 @@ Arguments:
 
 Note: this function is defined on [-1, 1] and is set to 0 for |x| > 1
 """
-function ZernikeR(n::Int, x::Union{Number,Array})
-	
-	y = @. (-1)^n * x * jacobi(2*x^2 - 1, n, 0, 1) * (abs.(x) <= 1)
-
-	return y
+function ZernikeR(n::Int, x::Number)
+	return (-1)^n * x * jacobi(2*x^2 - 1, n, 0, 1) * (abs(x) <= 1)
 end
+ZernikeR(n::Int, x::AbstractArray) = ZernikeR.(n, x)
 
 """
 Structure: `GridStruct`
@@ -81,48 +79,61 @@ Arguments:
  - `kr`, `l`: x and y points in Fourier space, Arrays
  - `Krsq`: `kr²+l²` in Fourier space, Array
 """
-struct GridStruct
+struct GridStruct{T<:Number, AT<:AbstractArray{T}}
     # position ranges for x and y
 	x
 	y
     # wavenumber arrays in Fourier space
-	kr::Union{Array{Float64},CuArray{Float64}}
-	l::Union{Array{Float64},CuArray{Float64}}
+	kr::AT
+	l::AT
     # K² = kr²+l² array in Fourier space
-	Krsq::Union{Array{Float64},CuArray{Float64}}	
+	Krsq::AT	
 end
 
+
+export is_gpu
+is_gpu(::GridStruct{T, AT}) where {T, AT} = AT <: CUDA.AbstractGPUArray
+export array_type
+array_type(::GridStruct{T, AT}) where {T, AT} = Base.typename(AT).wrapper{T}
+export adapt_to
+adapt_to(::GridStruct{T, AT}, x) where {T, AT} = Base.typename(AT).wrapper{T}(x)
+adapt_to(to::AT, x) where AT = Base.typename(AT).wrapper{eltype(to)}(x)
+import CUDA.Adapt
+using CUDA.Adapt: adapt
+Adapt.adapt_storage(::GridStruct{T, AT}, x) where {T, AT} = AT.name.wrapper{T}(x)
+
 """
-Function: `CreateGrid(Nx, Ny, Lx, Ly; cuda=false)`
+Function: `CreateGrid(Nx, Ny, Lx, Ly; gpu=false)`
 
 Define the numerical grid as a `GridStruct`
 
 Arguments:
  - `Nx`, `Ny`: number of gridpoints in x and y directions, Integers
  - `Lx`, `Ly`: x and y domains, either vectors of endpoints or lengths, Vectors or Numbers
- - `cuda`: `true`; use CUDA CuArray for fields (default: `false`)
+ - `ArrayType`: type of array to use, e.g. `CuArray` or `MtlArray`; `nothing` for no GPU (default: `nothing`)
 """
-function CreateGrid(Nx::Int, Ny::Int, Lx::Union{Number,Vector}, Ly::Union{Number,Vector}; cuda::Bool=false)
+function CreateGrid(Nx::Int, Ny::Int, Lx, Ly; ArrayType=Array)
+	@assert length(Lx) ≤ 2 && length(Ly) ≤ 2 "Lx and Ly must be a vector of length 2 or a number"
 
 	if length(Lx) == 2
 
 		x₀ = Lx[1]
-		Lx = Lx[2]
+		Lx = Lx[2] - Lx[1]
 
 	else
 
-		x₀ = -Lx/2
+		x₀ = -Lx[1]/2
 
 	end
 
 	if length(Ly) == 2
 	
 		y₀ = Ly[1]
-		Ly = Ly[2]
+		Ly = Ly[2] - Ly[1]
 
 	else
 
-		y₀ = -Ly/2
+		y₀ = -Ly[1]/2
 
 	end
 
@@ -131,24 +142,16 @@ function CreateGrid(Nx::Int, Ny::Int, Lx::Union{Number,Vector}, Ly::Union{Number
 
 	x  = range(x₀, step = Δx, length = Nx)
 	y  = range(y₀, step = Δy, length = Ny)
-	kr = Array(reshape(rfftfreq(Nx, 2π/Δx), (Int(Nx/2 + 1), 1)))
-	l  = Array(reshape( fftfreq(Ny, 2π/Δy), (1, Ny)))
+	kr = ArrayType(reshape(rfftfreq(Nx, 2π/Δx), (:, 1)))
+	l  = ArrayType(reshape( fftfreq(Ny, 2π/Δy), (1, :)))
 
 	Krsq = @. kr^2 + l^2
-
-	# Convert to CuArrays if using CUDA
-
-	if cuda
-
-		kr   = CuArray(kr)
-		l    = CuArray(l)
-		Krsq = CuArray(Krsq)
-
-	end
 
 	return GridStruct(x, y, kr, l, Krsq)
 
 end
+
+import CUDA.GPUArrays: @allowscalar
 
 """
 Function: `Calc_ψq(a, U, ℓ, R, β, grid, x₀=[0, 0], α=0)`
@@ -163,8 +166,8 @@ Arguments:
  - `x₀`: position of vortex center, vector (default: `[0, 0]`)
  - `α`: initial angle of vortex, Number (default: `0`)
 """
-function Calc_ψq(a::Array, U::Number, ℓ::Number, R::Union{Number,Vector}, β::Union{Number,Vector},
-	grid, x₀::Vector=[0, 0], α::Number=0)
+function Calc_ψq(a::AbstractArray, U::Number, ℓ::Number, R::Union{Number,AbstractVector}, β::Union{Number,AbstractVector},
+	grid::GridStruct{FT}, x₀::AbstractVector=[0, 0], α::Number=0) where {FT}
 	
 	M, N = size(a)
 
@@ -174,47 +177,50 @@ function Calc_ψq(a::Array, U::Number, ℓ::Number, R::Union{Number,Vector}, β:
 	
 	x, y = CartesianGrid(grid)	
 	r, θ = PolarGrid(x, y, x₀)
+	# r = adapt(grid, r)
+	# θ = adapt(grid, θ)
 
 	# Define temporary variable for RHS terms
 
-	F = zeros(Nx, Ny, N)
+	F = zeros(FT, Nx, Ny, N)
+	# F = similar(grid.Krsq, FT, Nx, Ny, N)
 
 	# Set RHS terms as sum of coefficients multiplied by Zernike polynomials
 
+	rℓ⁻¹ = r/ℓ  # Nx x Ny
+	zr = similar(rℓ⁻¹)  # Nx x Ny
+	# a = adapt(grid, a)  # M x N
 	for j in 1:M
-		
+		@. zr = ZernikeR(j-1, rℓ⁻¹)
+		# @allowscalar for i in 1:N
 		for i in 1:N
-			
-			F[:, :, i] += a[j, i] * ZernikeR(j-1, r/ℓ);
-			
+			F[:, :, i] += a[j, i] * zr
 		end
-		
 	end
 
 	# Fourier transform F, set (0, 0) mode to 0 to avoid NaN errors later
 
-	F = -U/ℓ * F .* sin.(θ .- α)
-	Fh = rfft(F, [1, 2])
+	@. F *= -U/ℓ * sin(θ - α)
+	Fh = rfft(F, (1, 2))
 	Fh[1, 1, :] .= 0
 
 	# Define PV inversion operators for ψ and q
 
-	ΔN_i = stack(inv, eachslice(ΔNCalc(grid.Krsq, R, β, U), dims=(3,4)))
+	ΔN_reg = ΔNCalc(grid.Krsq, R, β, U)
+	ΔN_i = stack(inv, eachslice(Array(ΔN_reg), dims=(3,4)))
 	ΔN_0 = ΔNCalc(grid.Krsq, R, 0)
 
 	# Define temporary variables for ψ and q in Fourier space
-
-	if grid.Krsq isa CuArray
-		
-		Fh = CuArray(Fh)
-		ψh = CuArray{ComplexF64}(zeros(Int(Nx/2+1), Ny, N))
-		qh = CuArray{ComplexF64}(zeros(Int(Nx/2+1), Ny, N))
-		
-	else
-		
-		ψh = Array{ComplexF64}(zeros(Int(Nx/2+1), Ny, N))
-		qh = Array{ComplexF64}(zeros(Int(Nx/2+1), Ny, N))
-		
+	# ψh_cpu = zeros(Complex{FT}, Int(Nx/2+1), Ny, N)
+	ψh = zero(similar(grid.Krsq, Complex{FT}, Int(Nx/2+1), Ny, N))
+	qh = zero(similar(grid.Krsq, Complex{FT}, Int(Nx/2+1), Ny, N))
+	
+	# Fh_cpu = copy(Fh)
+	if is_gpu(grid)
+		# Move to GPU
+		Fh = adapt(grid, Fh)
+		ψh = adapt(grid, ψh)
+		qh = adapt(grid, qh)
 	end
 
 	# Calculate ψ in each layer in Fourier space
@@ -228,6 +234,14 @@ function Calc_ψq(a::Array, U::Number, ℓ::Number, R::Union{Number,Vector}, β:
 		end
 		
 	end
+
+	for k in axes(Fh, 1)
+		for l in axes(Fh, 2)
+			ψh[k,l,:] = ΔN_reg[:,:,k,l] \ Fh[k,l,:]
+		end
+	end
+	@assert ψh_cpu ≈ ψh
+	return
 
 	# Calculate q in each layer in Fourier space
 
@@ -374,22 +388,19 @@ Arguments:
  - (`R`, `β`): Rossby radii and (y) PV gradients in each layer, Numbers or Vectors
  - `U`: vortex speed, Number (default: `1`)
 """
-function ΔNCalc(K²::Union{CuArray,Array}, R::Union{Number,Vector}, β::Union{Number,Vector}, U::Number=1)
-	
+function ΔNCalc(K²::AbstractArray{FT}, R::Union{Number,Vector}, β::Union{Number,Vector}, U::Number=1) where {FT}
+	R, β, U = FT.(R), FT.(β), FT(U)
+
 	N = length(R)
 	Nk, Nl = size(K²)
-	ϵ = max(1, maximum(R.^-2)) * 1e-15
+	ϵ = max(1, maximum(R.^-2)) * FT(1e-15)
 
 	# Define βU⁻¹ depending on input type
 	
-	if length(β) < N
-		
-		βU⁻¹ = zeros(N)
-		
+	βU⁻¹ = if length(β) < N
+		zeros(N)
 	else
-		
-		βU⁻¹ = β / U
-		
+		β / U
 	end
 
 	if N == 1
@@ -406,9 +417,9 @@ function ΔNCalc(K²::Union{CuArray,Array}, R::Union{Number,Vector}, β::Union{N
 		above_diagonal_elements =   R[1:end-1].^-2
 		below_diagonal_elements =   R[2:end].^-2
 		
-		if K² isa CuArray
+		if K² isa CUDA.AbstractGPUArray
 			
-			ΔN = CuArray(zeros(N, N, Nk, Nl))
+			ΔN = adapt_to(K², zeros(N, N, Nk, Nl))
 
 			K2 = reshape(K² .+ ϵ, 1, 1, Nk, Nl)
 
@@ -451,9 +462,20 @@ Arguments:
 
 Note: provide values of K₀ and a₀ for active layers ONLY.
 """
-function CreateModonLQG(grid, M::Int=8, U::Number=1, ℓ::Number=1, R::Union{Number,Vector}=1, β::Union{Number,Vector}=0,
-	ActiveLayers::Union{Number,Vector}=1, x₀::Vector=[0, 0], α::Number=0; K₀::Union{Number,Array,Nothing}=nothing,
-	a₀::Union{Array,Nothing}=nothing, tol=1e-6)
+function CreateModonLQG(;
+	grid,
+	M::Integer = 8,
+	U::Number = 1,
+	ℓ::Number = 1,
+	R::Union{Number,AbstractVector} = 1,
+	β::Union{Number,AbstractVector} = 0,
+	ActiveLayers::Union{Number,AbstractVector} = 1,
+	x₀::AbstractVector = [0, 0],
+	α::Number = 0,
+	K₀::Union{Number,AbstractArray,Nothing} = nothing,
+	a₀::Union{AbstractArray,Nothing} = nothing,
+	tol = 1e-6,
+)
 	
 	# If ActiveLayers size does not match size of R, assume all layers are active
 
@@ -504,9 +526,19 @@ Arguments:
 Note: Here R is the baroclinic Rossby radius, R = NH/f, and R' = R₀²/R where R₀ is
 the barotropic Rossby radius, R₀ = √(gH)/f. For infinite depth, R' = g/(fN).
 """
-function CreateModonSQG(grid, M::Int=12, U::Number=1, ℓ::Number=1, R::Vector=[Inf, Inf], β::Number=0,
-	x₀::Vector=[0, 0], α::Number=0; K₀::Union{Number,Array,Nothing}=nothing,
-	a₀::Union{Array,Nothing}=nothing, tol=1e-6)
+function CreateModonSQG(;
+	grid,
+	M::Int = 12,
+	U::Number = 1,
+	ℓ::Number = 1,
+	R::Union{Number,Vector} = [Inf, Inf],
+	β::Union{Number,Vector} = 0,
+	x₀::Vector = [0, 0],
+	α::Number = 0,
+	K₀::Union{Number,Array,Nothing} = nothing,
+	a₀::Union{Array,Nothing} = nothing,
+	tol = 1e-6,
+)
 	
 	# Define intermediate variables
 
@@ -668,7 +700,7 @@ function Eval_ψ_SQG(grid, ψ::Union{CuArray,Array}, z::Vector=[0], U::Number=1,
 
 	Nx = length(grid.x)
 	ϵ = 1e-15
-	
+
 	# Reshape z so the z direction corresponds to the third dimension of the output
 
 	z = reshape(z, 1, 1, :)
@@ -946,11 +978,7 @@ function Base.summary(g::GridStruct)
 
 	Nx, Ny = length(g.x), length(g.y)
 
-	if g.Krsq isa CuArray
-		dev = "GPU"
-	else
-		dev = "CPU"
-	end
+	dev = is_gpu(g) ? "GPU" : "CPU"
 
 	return string("Grid on ", dev, " with (Nx, Ny) = ", (Nx, Ny))
 end
@@ -964,11 +992,7 @@ function Base.show(io::IO, g::GridStruct)
 	Δx, Δy = g.x[2] - g.x[1], g.y[2] - g.y[1]
 	Lx, Ly = Nx * Δx, Ny * Δy
 
-	if g.Krsq isa CuArray
-		dev = "GPU"
-	else
-		dev = "CPU"
-	end
+	dev = is_gpu(g) ? "GPU" : "CPU"
 
 	return print(io, "GridStruct\n",
                "  ├────────────────────── device: ", dev, "\n",

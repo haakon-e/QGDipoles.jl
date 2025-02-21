@@ -68,7 +68,7 @@ Arguments:
  - `tol`: error tolerance for QuadGK via `JJ_int`, Number (default: `1e-6`)
  - `sqg`: `false`; creates layered QG system, `true`; creates SQG system (default: `false`)
 """
-function BuildLinSys(M::Int, λ::Union{Vector,Number}, μ::Union{Vector,Number}; tol::Number=1e-6, sqg::Bool=false)
+function BuildLinSys(M::Int, λ::Union{AbstractVector,Number}, μ::Union{AbstractVector,Number}; tol::Number=1e-6, sqg::Bool=false)
 
 	if sqg
 
@@ -257,56 +257,36 @@ Note: setting `sqg=true` overwrites the value of `m` and is equivalent to settin
 The option to set both is included for consistency with `BuildLinSys` and more generality
 with the value of `m`.
 """
-function SolveInhomEVP(A::Array, B::Array, c::Array, d::Array; K₀::Union{Number,Array,Nothing}=nothing,
-		a₀::Union{Array,Nothing}=nothing, tol::Number=1e-6, method::Int=0, m::Int=2,
-		sqg::Bool=false, warn::Bool=true)
+function SolveInhomEVP(A, B, c, d; 
+		K₀ = nothing, a₀ = nothing, tol = 1e-6, method = 0, m = 2, sqg = false, warn = true
+	)
 	
 	# Ensure that m is set correctly for SQG case
-
-	if sqg
-		
-		m = 1
-		
-	end
+	m = sqg ? 1 : m
 
 	# Ensure K₀ is a Vector
-
-	if K₀ isa Number
-		
-		K₀ = [K₀]
-		
-	end
+	K₀ = K₀ isa Number ? [K₀] : K₀
 
 	# Determine number of layers and number of coefficients from input
 	
-	N = size(d)[2]
-	M = Int(size(d)[1]/N)
+	N = size(d, 2)
+	M = Int(size(d, 1) / N)
 
 	# Use root finding method for multi-layer systems
-
-	if N > 1
-		
-		method = 1
-		
-	end
+	method = min(method, 1)
 
 	if method == 0
 	
 		# Use analytical solution if method = 0
 
 		# Set K₀ value if none given
-		
-		if K₀ isa Nothing
-			
-			K₀ = [4]
-			
-		end
+		K₀ = K₀ isa Nothing ? [4] : K₀
 
 		# Reformat inputs as arrays with correct shape
 
 		B  = reshape(B, M, M)
 		O  = zeros(M, M)
-		dᵀ = permutedims(d)
+		dᵀ = transpose(d)
 		c₀ = c[:, 1]
 		c₁ = c[:, 2]
 
